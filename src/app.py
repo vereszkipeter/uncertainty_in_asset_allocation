@@ -124,7 +124,7 @@ def run_monte_carlo_simulation(_returns_data, risk_free_rate, n_simulations=N_SI
     return results
 
 # --- ALKALMAZÁS FELÉPÍTÉSE ---
-st.title("Robusztus stratégiai eszközallokáció")
+st.title("Eszközallokáció: paraméterbecslési hiba hatás")
 
 TICKERS = {"USD Készpénz (BIL)": "BIL", "USA Állampapír (IEF)": "IEF", "USA Váll. Kötvény (LQD)": "LQD", "Arany (GLD)": "GLD"}
 ASSET_CLASSES = list(TICKERS.keys())
