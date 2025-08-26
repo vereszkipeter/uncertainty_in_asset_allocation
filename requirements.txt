@@ -4,3 +4,4 @@ numpy
 plotly
 yfinance
 scipy
+h5py
