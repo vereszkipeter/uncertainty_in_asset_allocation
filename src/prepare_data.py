@@ -1,279 +1,351 @@
-# prepare_data.py (Javított, formázott és kommentezett verzió)
+"""Build the simulation bundle consumed by the Streamlit app.
 
-import pandas as pd
-import numpy as np
-import yfinance
-from scipy.optimize import minimize
-import h5py
-import warnings
+The pipeline uses a joint row bootstrap:
+
+1. resample monthly return rows with replacement;
+2. use the bootstrap sample mean (annualized by 12) as the expected-return
+   draw;
+3. use the same bootstrap sample to estimate CVaR and the efficient frontier.
+
+This keeps expected-return uncertainty and distributional uncertainty
+coherent. In particular, the covariance of the bootstrap mean is of order
+``144 * Sigma / n``, which is the correct annualized sampling covariance of
+the expected-return estimator.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
 import time
-import os
+from dataclasses import dataclass
+from pathlib import Path
 
-# A scipy optimalizáció során előforduló futásidejű figyelmeztetések elrejtése.
-warnings.filterwarnings("ignore", category=RuntimeWarning)
+import numpy as np
+import pandas as pd
+import yfinance
 
-# --- KONFIGURÁCIÓS VÁLTOZÓK ---
-RISK_FREE_RATE = 0.02  # Kockázatmentes hozam (éves)
-N_SIMULATIONS = 100  # A Monte Carlo szimulációk száma
-START_DATE = "2010-01-01"  # Adatletöltés kezdő dátuma
-END_DATE = "2024-12-31"  # Adatletöltés záró dátuma
-DATA_DIR = "data"  # Könyvtár az adatok tárolására
-OUTPUT_FILE = os.path.join(DATA_DIR, "asset_allocation_uncertainty.h5")  # Kimeneti HDF5 fájl
-RETURNS_CSV_FILE = os.path.join(DATA_DIR, "monthly_returns.csv")  # Hozamok cache fájlja
+# Make sibling modules importable when this file is executed directly.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# Eszközosztályok és a hozzájuk tartozó Yahoo Finance tickerek.
-TICKERS = {
-    "USD Készpénz (BIL)": "BIL",
-    "USA Állampapír (IEF)": "IEF",
-    "USA Váll. Kötvény (LQD)": "LQD",
-    "Arany (GLD)": "GLD",
-}
-ASSET_CLASSES = list(TICKERS.keys())
-TICKER_LIST = list(TICKERS.values())
-
-
-# --- ADATLETÖLTŐ ÉS CACHELŐ FÜGGVÉNY ---
-def get_returns_data(csv_path, tickers, start_date, end_date):
-    """
-    Letölti vagy a helyi CSV cache-ből betölti az eszközök havi hozamait.
-    A letöltött adatokat elmenti a gyorsabb későbbi betöltés érdekében.
-    """
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    if os.path.exists(csv_path):
-        print(f"Hozamadatok betöltése a helyi cache-ből: '{csv_path}'")
-        return pd.read_csv(csv_path, index_col="date", parse_dates=True)
-
-    print("Helyi cache nem található. Adatok letöltése a yfinance segítségével...")
-    try:
-        # Adatok letöltése és 'Adj Close' helyett 'Close' használata auto_adjust=True-val
-        full_data = yfinance.download(
-            tickers, start=start_date, end=end_date, progress=False, auto_adjust=True
-        )
-        # Havi hozamok számítása: hónap végi ('M') adatokkal és százalékos változással.
-        returns_df = full_data["Close"].resample("M").ffill().pct_change().dropna()
-
-        # Adatstruktúra egységesítése
-        if isinstance(returns_df, pd.Series):
-            returns_df = returns_df.to_frame(name=ASSET_CLASSES[0])
-        else:
-            returns_df.columns = ASSET_CLASSES
-        returns_df.index.name = "date"
-        returns_df.to_csv(csv_path)
-        print(f"Adatok sikeresen lementve a cache-be: '{csv_path}'")
-        return returns_df
-    except Exception as e:
-        print(f"Hiba az adatletöltés során: {e}")
-        return pd.DataFrame()
+from config import (  # noqa: E402
+    ASSET_CLASSES,
+    CONFIDENCE_LEVEL,
+    END_DATE,
+    N_FRONTIER_POINTS,
+    N_SIMULATIONS,
+    RETURNS_CSV_FILE,
+    RISK_FREE_RATE,
+    SCHEMA_VERSION,
+    SEED,
+    SPECIAL_KEYS,
+    START_DATE,
+    TICKER_LIST,
+    TITLE,
+    HDF5_FILE,
+)
+from data_io import save_results  # noqa: E402
+from portfolio import (  # noqa: E402
+    annualized_mean,
+    draw_bootstrap_sample,
+    efficient_frontier,
+    optimize_special_portfolios,
+    portfolio_metrics,
+    portfolio_return,
+)
 
 
-# --- PORTFÓLIÓ-OPTIMALIZÁCIÓS FÜGGVÉNYEK ---
-def calculate_portfolio_cvar(weights, monthly_returns):
-    """Kiszámítja a portfólió Feltételes Várható Értékét (CVaR) 95%-os konfidenciaszinten."""
-    portfolio_returns = monthly_returns.dot(np.array(weights))
-    var = np.quantile(portfolio_returns, 0.05)  # 5%-os Value at Risk (VaR)
-    # A CVaR a VaR-nál rosszabb hozamok átlaga. Negatív előjellel adjuk vissza, mert a kockázatot minimalizáljuk.
-    return -portfolio_returns[portfolio_returns <= var].mean()
+@dataclass
+class SimulationResult:
+    """Arrays produced by :func:`run_simulations`."""
+
+    expected_returns: np.ndarray
+    bootstrap_returns: np.ndarray
+    special_points: dict[str, np.ndarray]
+    special_weights: dict[str, np.ndarray]
+    frontiers: list[pd.DataFrame]
+    failures: dict[str, int]
 
 
-def calculate_portfolio_return(weights, expected_returns):
-    """Kiszámítja a portfólió súlyozott évesített várható hozamát."""
-    return np.sum(np.array(weights) * expected_returns)
-
-
-def get_portfolio_metrics(weights, expected_returns, monthly_returns):
-    """Egyetlen függvényben adja vissza a portfólió CVaR és várható hozam metrikáit."""
-    cvar = calculate_portfolio_cvar(weights, monthly_returns)
-    ret = calculate_portfolio_return(weights, expected_returns)
-    return cvar, ret
-
-
-def neg_sharpe_ratio_cvar(weights, expected_returns, monthly_returns, risk_free_rate):
-    """A CVaR-alapú Sharpe-ráta negatívját számolja. Optimalizációhoz használjuk (minimalizálás)."""
-    p_cvar, p_ret = get_portfolio_metrics(weights, expected_returns, monthly_returns)
-    # Kezeljük az esetet, ha a kockázat (CVaR) nulla vagy negatív.
-    return -(p_ret - risk_free_rate) / p_cvar if p_cvar > 1e-6 else np.inf
-
-
-def risk_parity_cvar_objective(weights, monthly_returns):
-    """
-    CVaR-alapú kockázatparitás célfüggvény.
-    A cél, hogy minden eszköz hozzájárulása a portfólió farokkockázatához (CVaR) egyenlő legyen.
-    """
-    weights, num_assets = np.array(weights), len(weights)
-    portfolio_returns = monthly_returns.dot(weights)
-    var_threshold = np.quantile(portfolio_returns, 0.05)
-    tail_scenarios = monthly_returns[portfolio_returns <= var_threshold]
-
-    if tail_scenarios.empty:
-        return 1e6  # Ha nincsenek farokesemények, nagy büntetést adunk vissza.
-
-    # Kockázati hozzájárulások: súly * az eszköz átlagos negatív hozama a farokesemények során.
-    risk_contributions = weights * (-tail_scenarios.mean(axis=0).values)
-    total_risk = np.sum(risk_contributions)
-
-    if total_risk <= 1e-6:
-        return 1e6
-
-    # A cél a relatív kockázati hozzájárulások és az egyenlő (1/N) arány közötti négyzetes eltérés minimalizálása.
-    return np.sum(((risk_contributions / total_risk) - (1 / num_assets)) ** 2)
-
-
-def calculate_special_portfolios(expected_returns, monthly_returns, risk_free_rate):
-    """Kiszámítja a három nevezetes portfólió (Minimum Kockázat, Érintő, Kockázatparitás) súlyait."""
-    num_assets = len(expected_returns)
-    # Kezdeti súlyok: egyenlő elosztás.
-    initial_weights = np.full(num_assets, 1.0 / num_assets)
-    # Korlátok: minden súly 0 és 1 között legyen (nincs shortolás).
-    bounds = tuple((0.0, 1.0) for _ in range(num_assets))
-    # Megszorítás: a súlyok összege legyen 1.
-    constraints = {"type": "eq", "fun": lambda w: np.sum(w) - 1}
-
-    # Minimum Kockázatú portfólió (CVaR minimalizálása)
-    min_risk_res = minimize(
-        calculate_portfolio_cvar, initial_weights, args=(monthly_returns,),
-        method="SLSQP", bounds=bounds, constraints=constraints
-    )
-    # Érintő portfólió (Sharpe-ráta maximalizálása)
-    tangency_res = minimize(
-        neg_sharpe_ratio_cvar, initial_weights, args=(expected_returns, monthly_returns, risk_free_rate),
-        method="SLSQP", bounds=bounds, constraints=constraints
-    )
-    # Kockázatparitásos portfólió
-    risk_parity_res = minimize(
-        risk_parity_cvar_objective, initial_weights, args=(monthly_returns,),
-        method="SLSQP", bounds=bounds, constraints=constraints
-    )
-
-    return {
-        "min_risk": min_risk_res.x,
-        "tangency": tangency_res.x,
-        "risk_parity": risk_parity_res.x,
-    }
-
-
-def calculate_efficient_frontier(expected_returns, monthly_returns, n_points=20):
-    """Kiszámítja a hatékony front pontjait a CVaR-hozam térben."""
-    results = []
-    # Célhozamok definiálása a lehetséges hozamtartományban.
-    target_returns = np.linspace(min(expected_returns), max(expected_returns), n_points)
-    bounds = tuple((0.0, 1.0) for _ in range(len(expected_returns)))
-    initial_weights = np.full(len(expected_returns), 1.0 / len(expected_returns))
-
-    for target_ret in target_returns:
-        # Megszorítások: súlyok összege 1, és a portfólió hozama egyenlő a célhozammal.
-        constraints = (
-            {"type": "eq", "fun": lambda w: np.sum(w) - 1},
-            {"type": "eq", "fun": lambda w: calculate_portfolio_return(w, expected_returns) - target_ret},
-        )
-        # Optimalizálás: CVaR minimalizálása adott hozamszint mellett.
-        res = minimize(
-            calculate_portfolio_cvar, initial_weights, args=(monthly_returns,),
-            method="SLSQP", bounds=bounds, constraints=constraints
-        )
-        if res.success:
-            results.append({"cvar": res.fun, "ret": target_ret})
-
-    return (
-        pd.DataFrame(results).sort_values(by="cvar").drop_duplicates()
-        if results
-        else pd.DataFrame(columns=["cvar", "ret"])
-    )
-
-
-# --- FŐ VÉGREHAJTÓ BLOKK ---
-if __name__ == "__main__":
-    start_time = time.time()
-    returns_data = get_returns_data(RETURNS_CSV_FILE, TICKER_LIST, START_DATE, END_DATE)
+def validate_returns(returns_data: pd.DataFrame, asset_classes: list[str]) -> None:
+    """Fail fast on malformed return data."""
     if returns_data.empty:
-        print("Hiba: A hozamadatok üresek. A program leáll.")
-        exit()
-
-    print(f"\nIndul a {N_SIMULATIONS} db Monte Carlo szimuláció...")
-    num_obs, num_assets = returns_data.shape
-
-    # Bemeneti paraméterek a szimulációhoz:
-    # - Várható hozamok (évesítve) a historikus átlagokból.
-    base_er = returns_data.mean().values * 12
-    # - A várható hozamok becslési hibájának kovarianciamátrixa.
-    er_cov = np.diag(((returns_data.std() / np.sqrt(num_obs)) * np.sqrt(12)) ** 2)
-
-    # Tárolók a szimulációk inputjainak és outputjainak.
-    sim_inputs = {"expected_returns": [], "bootstrap_samples": []}
-    sim_outputs = {
-        "frontiers": [],
-        "min_risk_points": [], "tangency_points": [], "risk_parity_points": [],
-        "min_risk_weights": [], "tangency_weights": [], "risk_parity_weights": [],
-    }
-
-    # A Monte Carlo ciklus
-    for i in range(N_SIMULATIONS):
-        print(f"  - Feldolgozás: {i + 1}/{N_SIMULATIONS}")
-        # 1. Várható hozamok szimulálása (becslési bizonytalanság).
-        sim_er = np.random.multivariate_normal(mean=base_er, cov=er_cov)
-        # 2. Hozam-idősor szimulálása bootstrap módszerrel (eloszlás bizonytalansága).
-        bootstrap_sample = returns_data.sample(n=num_obs, replace=True)
-
-        # Inputok mentése
-        sim_inputs["expected_returns"].append(sim_er)
-        sim_inputs["bootstrap_samples"].append(bootstrap_sample)
-
-        # Számítások és outputok mentése az adott szimulációra
-        sim_outputs["frontiers"].append(
-            calculate_efficient_frontier(sim_er, bootstrap_sample)
+        raise ValueError("return data is empty")
+    if list(returns_data.columns) != list(asset_classes):
+        raise ValueError(
+            "return columns do not match the configured asset classes: "
+            f"{list(returns_data.columns)} != {list(asset_classes)}"
         )
-        special_weights = calculate_special_portfolios(
-            sim_er, bootstrap_sample, RISK_FREE_RATE
-        )
+    if returns_data.isna().any().any():
+        raise ValueError("return data contains missing values")
+    if not np.isfinite(returns_data.to_numpy(dtype=float)).all():
+        raise ValueError("return data contains non-finite values")
+    if not isinstance(returns_data.index, pd.DatetimeIndex):
+        raise ValueError("return data must have a DatetimeIndex")
+    if not returns_data.index.is_monotonic_increasing:
+        raise ValueError("return data must be sorted by date")
+    if len(returns_data) < 2:
+        raise ValueError("at least two monthly observations are required")
 
-        for key in ["min_risk", "tangency", "risk_parity"]:
-            metrics = get_portfolio_metrics(special_weights[key], sim_er, bootstrap_sample)
-            sim_outputs[f"{key}_points"].append(metrics)
-            sim_outputs[f"{key}_weights"].append(special_weights[key])
 
-    print("\nSzimulációk sikeresen lefutottak.")
-    print(f"Eredmények mentése a(z) '{OUTPUT_FILE}' fájlba...")
+def get_returns_data(
+    csv_path,
+    tickers: list[str],
+    asset_classes: list[str],
+    start_date: str,
+    end_date: str,
+    force_download: bool = False,
+) -> pd.DataFrame:
+    """Load monthly returns from the CSV cache, or download them.
 
-    # Eredmények mentése HDF5 fájlba
-    with h5py.File(OUTPUT_FILE, "w") as f:
-        f.attrs["title"] = "Az eszközallokáció input adataiban rejlő bizonytalanság"
-        
-        # Alap adatok (historikus)
-        base_group = f.create_group("base")
-        base_group.create_dataset("returns", data=returns_data.to_numpy())
-        base_group.create_dataset("dates", data=returns_data.index.astype(np.int64))
-        # JAVÍTÁS: A string listát közvetlenül adjuk át, elkerülve a dtype='S' hibát.
-        base_group.create_dataset("asset_names", data=ASSET_CLASSES)
-        
-        # Szimulációs inputok
-        inputs_group = f.create_group("simulation_inputs")
-        inputs_group.create_dataset("expected_returns", data=np.array(sim_inputs["expected_returns"]))
-        
-        # A bootstrap minták egyetlen nagy táblázatként mentése a hatékonyságért.
-        all_samples_df = pd.concat(
-            sim_inputs["bootstrap_samples"], keys=range(N_SIMULATIONS), names=["sim_id"]
-        ).reset_index()
-        date_column_name = all_samples_df.columns[1]
-        all_samples_df[date_column_name] = all_samples_df[date_column_name].astype(np.int64)
-        all_samples_df.rename(columns={date_column_name: "date"}, inplace=True)
-        inputs_group.create_dataset("bootstrap_samples", data=all_samples_df.to_numpy())
-        # JAVÍTÁS: Az oszlopneveket tartalmazó string listát is közvetlenül adjuk át.
-        inputs_group.create_dataset(
-            "bootstrap_samples_columns", data=all_samples_df.columns.tolist()
-        )
+    The cache is deliberately used by default so the pipeline is reproducible
+    and does not depend on the network. Pass ``force_download=True`` to refresh
+    it from Yahoo Finance.
+    """
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Szimulációs outputok
-        outputs_group = f.create_group("simulation_outputs")
-        for key in ["min_risk", "tangency", "risk_parity"]:
-            outputs_group.create_dataset(f"{key}_points", data=np.array(sim_outputs[f"{key}_points"]))
-            outputs_group.create_dataset(f"{key}_weights", data=np.array(sim_outputs[f"{key}_weights"]))
+    if csv_path.exists() and not force_download:
+        print(f"Loading monthly returns from cache: '{csv_path}'")
+        returns_data = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+        returns_data.index.name = "date"
+        missing = [name for name in asset_classes if name not in returns_data.columns]
+        if missing:
+            raise ValueError(f"cached CSV is missing columns: {missing}")
+        returns_data = returns_data.loc[:, asset_classes]
+        validate_returns(returns_data, asset_classes)
+        return returns_data
 
-        # A szimulált hatékony frontok külön csoportba kerülnek.
-        frontiers_group = outputs_group.create_group("efficient_frontiers")
-        for i, df in enumerate(sim_outputs["frontiers"]):
-            if not df.empty:
-                frontiers_group.create_dataset(f"frontier_{i}", data=df.to_numpy())
-
-    end_time = time.time()
-    print(
-        f"\nMinden adat sikeresen elmentve. Futási idő: {end_time - start_time:.2f} másodperc."
+    print("Downloading monthly returns from Yahoo Finance...")
+    # Yahoo Finance treats `end` as exclusive; the CLI date is inclusive.
+    download_end = (pd.Timestamp(end_date) + pd.Timedelta(days=1)).strftime(
+        "%Y-%m-%d"
     )
+    full_data = yfinance.download(
+        tickers,
+        start=start_date,
+        end=download_end,
+        progress=False,
+        auto_adjust=True,
+    )
+    if full_data is None or full_data.empty:
+        raise RuntimeError("Yahoo Finance returned no data")
+
+    close = full_data["Close"]
+    if isinstance(close, pd.Series):
+        close = close.to_frame(name=tickers[0])
+    else:
+        missing = [ticker for ticker in tickers if ticker not in close.columns]
+        if missing:
+            raise RuntimeError(f"downloaded data is missing tickers: {missing}")
+        close = close.loc[:, tickers]
+
+    returns_data = (
+        close.resample("ME").last().pct_change(fill_method=None).dropna()
+    )
+    returns_data.columns = asset_classes
+    returns_data.index.name = "date"
+    validate_returns(returns_data, asset_classes)
+    returns_data.to_csv(csv_path)
+    print(f"Saved monthly returns to cache: '{csv_path}'")
+    return returns_data
+
+
+def run_simulations(
+    returns_data: pd.DataFrame,
+    *,
+    n_simulations: int = N_SIMULATIONS,
+    seed: int = SEED,
+    risk_free_rate: float = RISK_FREE_RATE,
+    confidence: float = CONFIDENCE_LEVEL,
+    n_frontier_points: int = N_FRONTIER_POINTS,
+    progress=None,
+) -> SimulationResult:
+    """Run the joint bootstrap simulation and return all arrays."""
+    if n_simulations < 1:
+        raise ValueError("n_simulations must be positive")
+    if not 0.5 < confidence < 1.0:
+        raise ValueError("confidence must be between 0.5 and 1.0")
+
+    n_obs, n_assets = returns_data.shape
+    rng = np.random.default_rng(seed)
+
+    expected_returns = np.empty((n_simulations, n_assets), dtype=float)
+    bootstrap_returns = np.empty((n_simulations, n_obs, n_assets), dtype=float)
+    special_points = {
+        key: np.empty((n_simulations, 2), dtype=float) for key in SPECIAL_KEYS
+    }
+    special_weights = {
+        key: np.empty((n_simulations, n_assets), dtype=float)
+        for key in SPECIAL_KEYS
+    }
+    frontiers: list[pd.DataFrame] = []
+    failures = {key: 0 for key in SPECIAL_KEYS}
+
+    for index in range(n_simulations):
+        sample = draw_bootstrap_sample(returns_data, rng)
+        sim_expected_returns = annualized_mean(sample)
+
+        expected_returns[index] = sim_expected_returns
+        bootstrap_returns[index] = sample.to_numpy(dtype=float)
+
+        special = optimize_special_portfolios(
+            sim_expected_returns,
+            sample,
+            risk_free_rate,
+            confidence=confidence,
+        )
+        min_risk_return = portfolio_return(
+            special["min_risk"].weights, sim_expected_returns
+        )
+        frontiers.append(
+            efficient_frontier(
+                sim_expected_returns,
+                sample,
+                n_points=n_frontier_points,
+                confidence=confidence,
+                min_return=min_risk_return,
+            )
+        )
+
+        for key in SPECIAL_KEYS:
+            result = special[key]
+            if not result.success:
+                failures[key] += 1
+            special_weights[key][index] = result.weights
+            special_points[key][index] = portfolio_metrics(
+                result.weights,
+                sim_expected_returns,
+                sample,
+                confidence=confidence,
+            )
+
+        if progress is not None:
+            progress(index + 1, n_simulations)
+
+    return SimulationResult(
+        expected_returns=expected_returns,
+        bootstrap_returns=bootstrap_returns,
+        special_points=special_points,
+        special_weights=special_weights,
+        frontiers=frontiers,
+        failures=failures,
+    )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build the uncertainty-in-asset-allocation HDF5 bundle."
+    )
+    parser.add_argument(
+        "--simulations",
+        type=int,
+        default=N_SIMULATIONS,
+        help=f"number of bootstrap simulations (default: {N_SIMULATIONS})",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=SEED,
+        help=f"random seed (default: {SEED})",
+    )
+    parser.add_argument(
+        "--start",
+        default=START_DATE,
+        help=f"start date for the download (default: {START_DATE})",
+    )
+    parser.add_argument(
+        "--end",
+        default=END_DATE,
+        help=f"end date for the download (default: {END_DATE})",
+    )
+    parser.add_argument(
+        "--confidence",
+        type=float,
+        default=CONFIDENCE_LEVEL,
+        help=f"CVaR confidence level (default: {CONFIDENCE_LEVEL})",
+    )
+    parser.add_argument(
+        "--risk-free-rate",
+        type=float,
+        default=RISK_FREE_RATE,
+        help=f"annual risk-free rate (default: {RISK_FREE_RATE})",
+    )
+    parser.add_argument(
+        "--frontier-points",
+        type=int,
+        default=N_FRONTIER_POINTS,
+        help=f"points per efficient frontier (default: {N_FRONTIER_POINTS})",
+    )
+    parser.add_argument(
+        "--force-download",
+        action="store_true",
+        help="ignore the CSV cache and download fresh data",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    start_time = time.time()
+
+    returns_data = get_returns_data(
+        RETURNS_CSV_FILE,
+        TICKER_LIST,
+        ASSET_CLASSES,
+        args.start,
+        args.end,
+        force_download=args.force_download,
+    )
+    validate_returns(returns_data, ASSET_CLASSES)
+
+    print(
+        f"\nRunning {args.simulations} joint bootstrap simulations "
+        f"(seed={args.seed}, confidence={args.confidence:.0%})..."
+    )
+
+    def progress(done: int, total: int) -> None:
+        print(f"  - {done}/{total}")
+
+    result = run_simulations(
+        returns_data,
+        n_simulations=args.simulations,
+        seed=args.seed,
+        risk_free_rate=args.risk_free_rate,
+        confidence=args.confidence,
+        n_frontier_points=args.frontier_points,
+        progress=progress,
+    )
+
+    metadata = {
+        "schema_version": SCHEMA_VERSION,
+        "seed": args.seed,
+        "n_simulations": args.simulations,
+        "confidence_level": args.confidence,
+        "risk_free_rate": args.risk_free_rate,
+    }
+    save_results(
+        HDF5_FILE,
+        title=TITLE,
+        returns_data=returns_data,
+        expected_returns=result.expected_returns,
+        bootstrap_returns=result.bootstrap_returns,
+        special_points=result.special_points,
+        special_weights=result.special_weights,
+        frontiers=result.frontiers,
+        metadata=metadata,
+    )
+
+    failed = {key: count for key, count in result.failures.items() if count}
+    if failed:
+        print(f"Warning: optimizer failures (fallback used): {failed}")
+    else:
+        print("All special-portfolio optimizations converged.")
+
+    print(f"\nSaved simulation bundle to '{HDF5_FILE}'.")
+    print(f"Total runtime: {time.time() - start_time:.2f} seconds.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
