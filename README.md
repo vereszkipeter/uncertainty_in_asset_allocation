@@ -155,6 +155,27 @@ The app reads `data/asset_allocation_uncertainty.h5`. If the file is missing or
 was written with an older schema, the app shows an error asking you to run
 `python src/prepare_data.py`.
 
+### Dashboard layout and visual conventions
+
+- The page title is deliberately short; the longer title is kept as HDF5
+  metadata. The chart has no duplicate in-chart title.
+- The simulation control is the first sidebar control and is labelled
+  **Minta bizonytalanság** (sample uncertainty), because the bootstrap
+  resamples the historical return sample rather than a structural model.
+- The chart legend sits below the plot and uses the Okabe-Ito
+  colorblind-safe palette. Bootstrap traces share one opaque legend entry
+  (`Bootstrap felhők`); the underlying clouds are thin, translucent outlines
+  with distinct marker shapes per portfolio.
+- The current portfolio's annualized return and monthly CVaR are shown
+  together with help text clarifying their different horizons.
+- The chart annotation quantifies the CVaR gap between the user's portfolio
+  and the efficient frontier at the same expected return, and flags a
+  min-risk portfolio that is 100% cash.
+- Weights are shown as a transposed table (portfolios in rows, tickers in
+  columns) and a second table reports annualized return and monthly CVaR.
+  Both live in the **Portfóliósúlyok és mutatók** expander. The chart also
+  has an `alt` description for screen readers.
+
 ## Tests
 
 ```bash
@@ -169,7 +190,11 @@ The suite covers:
 - monotonicity of the efficient frontier;
 - the `144 * Sigma / n` covariance scaling and the joint-bootstrap covariance;
 - pipeline reproducibility and shape/consistency checks;
-- HDF5 round-trip and schema-version rejection.
+- HDF5 round-trip and schema-version rejection;
+- the dashboard's table builders, ticker labels, frontier interpolation and
+  insight text;
+- a Streamlit `AppTest` smoke test for the page title, sidebar controls,
+  tables and the simulation toggle.
 
 ## Validation of the committed bundle
 
@@ -189,7 +214,7 @@ With the committed data (`n=180`, `100` simulations, `seed=42`):
   The tangency weights remain highly dispersed, as expected.
 - All 100 efficient frontiers are non-empty and monotone in both CVaR and
   expected return; the average number of retained points is 19.5 out of 20.
-- The full test suite passes: **21 tests**.
+- The full test suite passes: **32 tests**.
 
 These are statistical checks, not a guarantee that the point estimates are
 unbiased. The bootstrap is conditional on the historical sample.

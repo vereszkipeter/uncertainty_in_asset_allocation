@@ -13,6 +13,10 @@ RETURNS_CSV_FILE = DATA_DIR / "monthly_returns.csv"
 
 TITLE = "Az eszközallokáció input adataiban rejlő bizonytalanság"
 
+# Short page title for the dashboard. The longer TITLE is kept as the HDF5
+# metadata description so the data bundle remains self-describing.
+APP_TITLE = "Eszközallokáció bizonytalansága"
+
 # Asset universe. The dict order defines the column order everywhere.
 TICKERS = {
     "USD Készpénz (BIL)": "BIL",

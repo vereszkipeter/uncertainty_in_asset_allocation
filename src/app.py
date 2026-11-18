@@ -20,12 +20,12 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (  # noqa: E402
+    APP_TITLE,
     CACHE_VERSION,
     CONFIDENCE_LEVEL,
     HDF5_FILE,
     N_FRONTIER_POINTS,
     RISK_FREE_RATE,
-    TITLE,
 )
 from data_io import load_results  # noqa: E402
 from portfolio import (  # noqa: E402
@@ -35,35 +35,60 @@ from portfolio import (  # noqa: E402
     portfolio_metrics,
     portfolio_return,
 )
+from ui_helpers import (  # noqa: E402
+    build_metrics_table,
+    build_weights_table,
+    format_weights_for_tooltip,
+    frontier_insight,
+    ticker_label,
+    to_rgba,
+)
 
 # --- Page configuration -----------------------------------------------------
-st.set_page_config(page_title="Eszközallokáció Bizonytalansága", layout="wide")
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="📊",
+    layout="wide",
+)
 
+# The default Streamlit h1 is large enough to wrap the Hungarian title on a
+# laptop viewport, pushing the chart below the fold. A slightly smaller title
+# keeps it on one line without changing the document structure.
+st.markdown(
+    """
+    <style>
+    h1 {
+        font-size: 1.75rem !important;
+        line-height: 1.2 !important;
+        margin-bottom: 0.25rem !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Okabe-Ito colorblind-safe palette.
 COLORS = {
-    "frontier": "#4169E1",
-    "assets": "#D3D3D3",
-    "user": "#DC143C",
-    "min_risk": "#32CD32",
-    "tangency": "#9400D3",
-    "risk_parity": "#FF8C00",
+    "frontier": "#0072B2",
+    "assets": "#7F7F7F",
+    "user": "#D55E00",
+    "min_risk": "#009E73",
+    "tangency": "#CC79A7",
+    "risk_parity": "#E69F00",
+}
+PORTFOLIO_NAMES = {
+    "min_risk": "Min Risk",
+    "tangency": "Tangency",
+    "risk_parity": "Risk Parity",
+}
+SIMULATION_SYMBOLS = {
+    "min_risk": "circle-open",
+    "tangency": "square-open",
+    "risk_parity": "triangle-up-open",
 }
 
 
 # --- Helpers ----------------------------------------------------------------
-def format_weights_for_tooltip(weights, asset_names) -> str:
-    """Format portfolio weights as an HTML block for Plotly tooltips."""
-    header = "<br><b>Portfólió súlyok:</b><br>"
-    lines = [f"{name}: {weight:.2%}" for name, weight in zip(asset_names, weights)]
-    return header + "<br>".join(lines)
-
-
-def to_rgba(hex_color: str, alpha: float) -> str:
-    return (
-        f"rgba({int(hex_color[1:3], 16)}, {int(hex_color[3:5], 16)}, "
-        f"{int(hex_color[5:7], 16)}, {alpha})"
-    )
-
-
 def calculate_user_portfolio_cloud(
     weights_vector, sim_ers, bootstrap_samples_list, confidence: float
 ) -> pd.DataFrame:
@@ -131,7 +156,7 @@ confidence = float(all_data.get("confidence_level", CONFIDENCE_LEVEL))
 risk_free_rate = float(all_data.get("risk_free_rate", RISK_FREE_RATE))
 base_er = annualized_mean(returns_data)
 
-st.title(all_data.get("title") or TITLE)
+st.title(APP_TITLE)
 st.caption(
     f"{returns_data.index.min():%Y-%m} – {returns_data.index.max():%Y-%m} | "
     f"{len(asset_classes)} eszköz | "
@@ -169,11 +194,25 @@ with st.spinner("Alap portfóliók és hatékony front számítása..."):
     )
 
 # --- Sidebar ----------------------------------------------------------------
-st.sidebar.header("A portfólió súlyai")
-if st.sidebar.button("Egyenlő súlyok visszaállítása", use_container_width=True):
-    for asset in asset_classes:
-        st.session_state[f"weight_{asset}"] = 1.0 / len(asset_classes)
+# The simulation switch is intentionally the first control: it used to sit
+# below four sliders and fell below the fold on a laptop viewport.
+st.sidebar.header("Minta bizonytalanság")
+show_simulations = st.sidebar.toggle(
+    "Bootstrap felhők megjelenítése",
+    value=False,
+    help=(
+        "A pontbecslések mellett a 100 bootstrap minta szimulált "
+        "portfólióit is megjeleníti a grafikonon."
+    ),
+)
+if show_simulations:
+    st.sidebar.caption(
+        "A halvány pontok és frontok ugyanazokból a bootstrap mintákból "
+        "származnak, mint a pontbecslések bizonytalansági sávja."
+    )
 
+st.sidebar.divider()
+st.sidebar.header("A portfólió súlyai")
 weights = {
     asset: st.sidebar.slider(
         f"{index + 1}. {asset}",
@@ -190,40 +229,31 @@ total_w = sum(weights.values())
 if total_w > 0:
     norm_weights = {asset: weight / total_w for asset, weight in weights.items()}
 else:
-    norm_weights = {
-        asset: 1.0 / len(asset_classes) for asset in asset_classes
-    }
+    norm_weights = {asset: 1.0 / len(asset_classes) for asset in asset_classes}
 weights_vector = np.array(
     [norm_weights[asset] for asset in asset_classes], dtype=float
 )
 
-st.sidebar.subheader("Aktuális súlyok (normalizált)")
-for asset, weight in norm_weights.items():
-    st.sidebar.write(f"{asset}: {weight:.2%}")
-
-st.sidebar.header("Modell bizonytalanság")
-show_simulations = st.sidebar.checkbox(
-    "Bizonytalanság megjelenítése", value=False
-)
-if show_simulations:
-    st.sidebar.info(
-        "A pontbecslések mellett a bootstrap szimulált eredmények "
-        "(halványabb pontfelhők és vonalak) is láthatók a grafikonon."
+st.sidebar.caption("Normalizált súlyok")
+st.sidebar.markdown(
+    " · ".join(
+        f"**{ticker_label(asset)}** {norm_weights[asset]:.1%}"
+        for asset in asset_classes
     )
+)
+if st.sidebar.button("Egyenlő súlyok visszaállítása", width="stretch"):
+    for asset in asset_classes:
+        st.session_state[f"weight_{asset}"] = 1.0 / len(asset_classes)
 
-# --- Main metrics -----------------------------------------------------------
+# --- Current portfolio summary and chart -----------------------------------
 user_cvar, user_ret = portfolio_metrics(
     weights_vector, base_er, returns_data, confidence
 )
-st.subheader("A portfólió jellemzői (pontbecslés alapján)")
-metric_columns = st.columns(2)
-metric_columns[0].metric("Évesített várható hozam", f"{user_ret * 100:.2f}%")
-metric_columns[1].metric(
-    f"Havi CVaR ({confidence:.0%})", f"{user_cvar * 100:.2f}%"
+st.caption(
+    f"Az Ön portfóliója: **{user_ret:.2%}** évesített hozam · "
+    f"**{user_cvar:.2%}** havi CVaR ({confidence:.0%})"
 )
-
-# --- Chart ------------------------------------------------------------------
-st.subheader("Portfóliók a kockázat (CVaR) - hozam térben")
+st.subheader("Kockázat–hozam tér")
 figure = go.Figure()
 
 if show_simulations:
@@ -233,10 +263,12 @@ if show_simulations:
                 x=frontier["cvar"],
                 y=frontier["ret"],
                 mode="lines",
-                line_color=to_rgba(COLORS["frontier"], 0.1),
-                name="Szimulált frontok",
-                legendgroup="sim_frontiers",
-                showlegend=(index == 0),
+                line=dict(color=to_rgba(COLORS["frontier"], 0.12), width=1),
+                hoverinfo="skip",
+                name="Bootstrap frontok",
+                legendgroup="bootstrap",
+                legendrank=10,
+                showlegend=False,
             )
         )
 
@@ -253,11 +285,18 @@ if show_simulations:
                 y=points["ret"],
                 text=hover_texts,
                 mode="markers",
-                marker=dict(color=to_rgba(COLORS[key], 0.2), size=7),
-                name=f'Szimulált {key.replace("_", " ")}',
-                legendgroup=f"sim_{key}",
+                marker=dict(
+                    color=to_rgba(COLORS[key], 0.18),
+                    size=7,
+                    symbol=SIMULATION_SYMBOLS[key],
+                    line=dict(color=to_rgba(COLORS[key], 0.85), width=1.2),
+                ),
+                name=f"Bootstrap: {PORTFOLIO_NAMES[key]}",
+                legendgroup="bootstrap",
+                legendrank=10,
+                showlegend=False,
                 hovertemplate=(
-                    f"<b>Szimulált {key.replace('_', ' ')}</b><br><br>"
+                    f"<b>Bootstrap: {PORTFOLIO_NAMES[key]}</b><br><br>"
                     "Kockázat (CVaR): %{x:.2%}<br>"
                     "Várható Hozam: %{y:.2%}%{text}<extra></extra>"
                 ),
@@ -280,16 +319,44 @@ if show_simulations:
                 y=user_cloud_df["ret"],
                 customdata=[user_weights_text_cloud] * len(user_cloud_df),
                 mode="markers",
-                marker=dict(color=to_rgba(COLORS["user"], 0.3), size=7),
-                name="Az Ön portfóliójának szimulációi",
-                legendgroup="sim_user",
+                marker=dict(
+                    color=to_rgba(COLORS["user"], 0.2),
+                    size=7,
+                    symbol="star-open",
+                    line=dict(color=to_rgba(COLORS["user"], 0.9), width=1.2),
+                ),
+                name="Bootstrap: Az Ön portfóliója",
+                legendgroup="bootstrap",
+                legendrank=10,
+                showlegend=False,
                 hovertemplate=(
-                    "<b>Szimulált pont (Ön)</b><br><br>"
+                    "<b>Bootstrap: Az Ön portfóliója</b><br><br>"
                     "Kockázat (CVaR): %{x:.2%}<br>"
                     "Várható Hozam: %{y:.2%}%{customdata}<extra></extra>"
                 ),
             )
         )
+
+    # One legend entry controls the whole bootstrap group. The actual traces
+    # stay thin and transparent, while this opaque dummy supplies a readable
+    # swatch on both light and dark themes.
+    figure.add_trace(
+        go.Scatter(
+            x=[None],
+            y=[None],
+            mode="markers",
+            marker=dict(
+                color="#8C8C8C",
+                size=9,
+                symbol="square-open",
+                line=dict(color="#8C8C8C", width=1.5),
+            ),
+            name="Bootstrap felhők",
+            legendgroup="bootstrap",
+            legendrank=10,
+            hoverinfo="skip",
+        )
+    )
 
 figure.add_trace(
     go.Scatter(
@@ -297,29 +364,46 @@ figure.add_trace(
         y=base_frontier["ret"],
         mode="lines",
         line=dict(color=COLORS["frontier"], width=3),
-        name="Hatékony front (pontbecslés)",
+        name="Hatékony front",
+        legendrank=1,
     )
 )
 
+asset_cvar = base_assets_df["cvar"].to_numpy()
 for index, asset_name in enumerate(asset_classes):
     asset_label = re.sub(r"\s*\([^)]*\)", "", asset_name)
     asset_weights = identity[index]
     weights_text_asset = format_weights_for_tooltip(asset_weights, asset_classes)
+    cvar = float(asset_cvar[index])
+    # Put labels on the inside of the plot so the rightmost asset cannot be
+    # clipped at the chart edge. The lowest-risk asset sits on the y-axis and
+    # next to the Min Risk point, so its label goes below the marker; the
+    # highest-risk asset gets a label above the marker.
+    if index == int(np.argmin(asset_cvar)):
+        text_position = "bottom right"
+    elif index == int(np.argmax(asset_cvar)):
+        text_position = "top center"
+    elif cvar > base_assets_df["cvar"].median():
+        text_position = "middle left"
+    else:
+        text_position = "middle right"
     figure.add_trace(
         go.Scatter(
-            x=[base_assets_df["cvar"].iloc[index]],
+            x=[cvar],
             y=[base_assets_df["ret"].iloc[index]],
             mode="markers+text",
             marker=dict(
                 size=12,
                 color=COLORS["assets"],
                 symbol="diamond",
-                line=dict(color="black", width=1),
+                line=dict(color="#555555", width=1),
             ),
             text=asset_label,
-            textposition="middle right",
+            textposition=text_position,
+            cliponaxis=False,
             name="Egyedi eszközök",
             legendgroup="assets",
+            legendrank=2,
             showlegend=(index == 0),
             customdata=[weights_text_asset],
             hovertemplate=(
@@ -330,13 +414,8 @@ for index, asset_name in enumerate(asset_classes):
         )
     )
 
-portfolio_labels = {
-    "min_risk": "Min Risk",
-    "tangency": "Tangency",
-    "risk_parity": "Risk Parity",
-}
 symbols = {"min_risk": "circle", "tangency": "square", "risk_parity": "triangle-up"}
-for key, label in portfolio_labels.items():
+for rank, (key, label) in enumerate(PORTFOLIO_NAMES.items(), start=3):
     cvar, ret = base_metrics[key]
     weights_text = format_weights_for_tooltip(
         base_special_weights[key], asset_classes
@@ -351,9 +430,10 @@ for key, label in portfolio_labels.items():
                 size=15,
                 color=COLORS[key],
                 symbol=symbols[key],
-                line=dict(width=1, color="black"),
+                line=dict(width=1, color="#555555"),
             ),
-            name=f"{label} portfólió",
+            name=label,
+            legendrank=rank,
             hovertemplate=(
                 f"<b>{label} portfólió</b><br><br>"
                 "Kockázat (CVaR): %{x:.2%}<br>"
@@ -373,9 +453,10 @@ figure.add_trace(
             size=18,
             color=COLORS["user"],
             symbol="star",
-            line=dict(width=1, color="black"),
+            line=dict(width=1, color="#555555"),
         ),
-        name="Az Ön portfóliója",
+        name="Ön portfóliója",
+        legendrank=6,
         hovertemplate=(
             "<b>Az Ön portfóliója</b><br><br>"
             "Kockázat (CVaR): %{x:.2%}<br>"
@@ -385,54 +466,150 @@ figure.add_trace(
 )
 
 figure.update_layout(
-    xaxis_title=f"Havi CVaR ({confidence:.0%}) - Kockázat",
-    yaxis_title="Évesített várható hozam",
-    yaxis_tickformat=".2%",
-    xaxis_tickformat=".2%",
-    legend=dict(yanchor="top", y=0.98, xanchor="left", x=0.01),
-    height=700,
-    title="A portfólióallokáció bizonytalansága a kockázat-hozam térben",
+    xaxis=dict(
+        title=f"Havi CVaR ({confidence:.0%}) – kockázat",
+        tickformat=".1%",
+        hoverformat=".2%",
+        nticks=6,
+        automargin=True,
+        zeroline=False,
+    ),
+    yaxis=dict(
+        title="Évesített várható hozam",
+        tickformat=".1%",
+        hoverformat=".2%",
+        nticks=6,
+        automargin=True,
+        zeroline=False,
+    ),
+    legend=dict(
+        orientation="h",
+        yanchor="top",
+        y=-0.2,
+        xanchor="center",
+        x=0.5,
+        entrywidth=110,
+        entrywidthmode="pixels",
+        groupclick="togglegroup",
+        font=dict(size=11),
+        bgcolor="rgba(0,0,0,0)",
+    ),
+    height=540,
+    margin=dict(l=10, r=10, t=10, b=120),
+    hovermode="closest",
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
 )
-st.plotly_chart(figure, use_container_width=True)
+st.plotly_chart(
+    figure,
+    width="stretch",
+    alt=(
+        "Szórásdiagram a portfóliók havi CVaR kockázata és évesített várható "
+        "hozama között. A hatékony front mellett a Min Risk, Tangency, Risk "
+        "Parity és az Ön portfóliója, valamint az egyedi eszközök láthatók."
+    ),
+)
+
+min_risk_index = int(np.argmax(base_special_weights["min_risk"]))
+min_risk_note = ""
+if base_special_weights["min_risk"][min_risk_index] >= 0.995:
+    min_risk_note = (
+        f" A Min Risk portfólió {ticker_label(asset_classes[min_risk_index])} "
+        "eszközben van 100%-ban."
+    )
 st.caption(
-    "A Risk Parity portfólió szórásalapú kockázatparitás; "
-    "a CVaR a chart kockázati tengelye."
+    f"{frontier_insight(user_cvar, user_ret, base_frontier)} "
+    "A Risk Parity portfólió szórásalapú kockázatparitás; a CVaR a chart "
+    f"kockázati tengelye.{min_risk_note}"
 )
 
-# --- Weights table and methodology -----------------------------------------
-with st.expander("Portfóliósúlyok táblázata"):
-    weights_table = pd.DataFrame(
-        {
-            "Eszköz": asset_classes,
-            "Az Ön portfóliója": weights_vector,
-            "Min Risk": base_special_weights["min_risk"],
-            "Tangency": base_special_weights["tangency"],
-            "Risk Parity": base_special_weights["risk_parity"],
-        }
-    )
-    st.dataframe(
-        weights_table.style.format(
-            {
-                column: "{:.2%}"
-                for column in weights_table.columns
-                if column != "Eszköz"
-            }
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
+# --- Detailed current portfolio metrics ------------------------------------
+st.subheader("Az Ön portfóliója")
+metric_columns = st.columns(2)
+metric_columns[0].metric(
+    "Évesített várható hozam",
+    f"{user_ret:.2%}",
+    help="A havi átlagos hozam ×12; ez nem hozam-előrejelzés.",
+)
+metric_columns[1].metric(
+    f"Havi CVaR ({confidence:.0%})",
+    f"{user_cvar:.2%}",
+    help=(
+        f"A legrosszabb {1 - confidence:.0%} havi hozam átlagos vesztesége. "
+        "A CVaR havi, a hozam évesített mértékegységű."
+    ),
+)
+st.caption(
+    "A hozam évesített, a CVaR havi veszteség. A két mutató eltérő "
+    "időhorizonton értelmezendő."
+)
 
+# --- Weights and metrics tables --------------------------------------------
+weights_by_portfolio = {**base_special_weights, "user": weights_vector}
+asset_legend = " · ".join(
+    f"{ticker_label(asset)} = {re.sub(r'\s*\([^)]*\)', '', asset)}"
+    for asset in asset_classes
+)
+with st.expander("Portfóliósúlyok és mutatók"):
+    weights_tab, metrics_tab = st.tabs(["Súlyok", "Mutatók"])
+    with weights_tab:
+        weights_table = build_weights_table(asset_classes, weights_by_portfolio)
+        st.dataframe(
+            weights_table.style.format(
+                {
+                    column: "{:.2%}"
+                    for column in weights_table.columns
+                    if column != "Portfólió"
+                }
+            ),
+            width="stretch",
+            height="auto",
+            hide_index=True,
+            alt="Portfóliósúlyok: soronként egy portfólió, oszloponként egy ticker.",
+        )
+        st.caption(asset_legend)
+
+    with metrics_tab:
+        metrics_table = build_metrics_table(
+            asset_classes,
+            weights_by_portfolio,
+            base_er,
+            returns_data,
+            confidence,
+        )
+        st.dataframe(
+            metrics_table.style.format(
+                {
+                    "Évesített hozam": "{:.2%}",
+                    "Havi CVaR": "{:.2%}",
+                }
+            ),
+            width="stretch",
+            height="auto",
+            hide_index=True,
+            alt=(
+                "Portfóliónkénti évesített hozam és havi CVaR. "
+                "A CVaR havi veszteség, a hozam évesített."
+            ),
+        )
+        st.caption(
+            "A hozam évesített, a CVaR havi veszteség; a két oszlop eltérő "
+            "időhorizontú."
+        )
+
+# --- Methodology ------------------------------------------------------------
 with st.expander("Módszertan és korlátok"):
     st.markdown(
         f"""
         - **Adatok:** havi hozamok {returns_data.index.min():%Y-%m} és
           {returns_data.index.max():%Y-%m} között, {len(asset_classes)} ETF-ből.
-        - **Bizonytalanság:** *joint bootstrap*. Minden szimulációban
+        - **Minta-bizonytalanság:** *joint bootstrap*. Minden szimulációban
           újramintavételezzük a havi hozamokat, majd ugyanabból a mintából
           számítjuk a várható hozamot, a CVaR-t és a hatékony frontot.
         - **Várható hozam:** a bootstrap minta átlaga × 12 (évesítve).
         - **Kockázat:** havi empirikus CVaR (Expected Shortfall),
-          {confidence:.0%}-os konfidenciaszinten.
+          {confidence:.0%}-os konfidenciaszinten. A hozam évesített, a CVaR
+          havi mértékegységű.
         - **Risk parity:** a variancia-hozzájárulásokat egyenlíti ki
           (szórásalapú, mind a négy eszközre). A CVaR-alapú
           hozzájárulások a farokban negatívak lehetnek a cash esetében,
