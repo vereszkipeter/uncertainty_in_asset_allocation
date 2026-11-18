@@ -13,7 +13,9 @@ from portfolio import (
     optimize_special_portfolios,
     portfolio_cvar,
     portfolio_return,
-    risk_parity_cvar_objective,
+    risk_parity_variance_objective,
+    risk_parity_volatility_weights,
+    variance_risk_contributions,
 )
 
 
@@ -64,7 +66,7 @@ def test_cvar_risk_contributions_sum_to_cvar(synthetic_returns) -> None:
     assert contributions.sum() == pytest.approx(cvar, rel=1e-10)
 
 
-def test_risk_parity_equalizes_contributions(synthetic_returns) -> None:
+def test_risk_parity_equalizes_variance_contributions(synthetic_returns) -> None:
     result = optimize_special_portfolios(
         annualized_mean(synthetic_returns),
         synthetic_returns,
@@ -72,14 +74,30 @@ def test_risk_parity_equalizes_contributions(synthetic_returns) -> None:
         confidence=0.95,
     )
     weights = result["risk_parity"].weights
-    contributions = cvar_risk_contributions(
-        weights, synthetic_returns, confidence=0.95
-    )
+    contributions = variance_risk_contributions(weights, synthetic_returns)
     relative = contributions / contributions.sum()
-    assert np.max(np.abs(relative - 0.25)) < 0.02
-    assert risk_parity_cvar_objective(
-        weights, synthetic_returns, confidence=0.95
-    ) < 1e-4
+    assert np.max(np.abs(relative - 0.25)) < 1e-6
+    assert risk_parity_variance_objective(weights, synthetic_returns) < 1e-12
+
+
+def test_risk_parity_weights_are_internal(synthetic_returns) -> None:
+    """Volatility risk parity must not collapse to a corner solution."""
+    result = risk_parity_volatility_weights(synthetic_returns)
+    assert result.success
+    assert np.all(result.weights > 1e-6)
+    assert result.weights.sum() == pytest.approx(1.0)
+    # The lowest-volatility asset should receive the largest weight.
+    assert int(np.argmax(result.weights)) == 0
+
+
+def test_risk_parity_weights_are_stable_under_bootstrap(synthetic_returns) -> None:
+    rng = np.random.default_rng(11)
+    draws = []
+    for _ in range(50):
+        sample = draw_bootstrap_sample(synthetic_returns, rng)
+        draws.append(risk_parity_volatility_weights(sample).weights)
+    draws = np.asarray(draws)
+    assert np.max(draws.std(axis=0)) < 0.02
 
 
 def test_special_portfolios_are_feasible(synthetic_returns) -> None:

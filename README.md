@@ -5,7 +5,7 @@ A small research dashboard for studying how uncertainty in **input estimates**
 asset-allocation decision.
 
 The app visualizes the point-estimate efficient frontier, three reference
-portfolios (minimum risk, CVaR tangency and CVaR risk parity), and the
+portfolios (minimum risk, CVaR tangency and volatility risk parity), and the
 bootstrap uncertainty cloud around them.
 
 ## What is in the repository
@@ -14,7 +14,7 @@ bootstrap uncertainty cloud around them.
 | --- | --- |
 | `src/prepare_data.py` | Downloads/caches monthly returns, runs the joint bootstrap, and writes the HDF5 bundle. |
 | `src/app.py` | Streamlit dashboard (Hungarian UI). |
-| `src/portfolio.py` | Shared portfolio math: CVaR, risk contributions, optimizers, frontier, bootstrap helpers. |
+| `src/portfolio.py` | Shared portfolio math: CVaR, variance/CVaR contributions, optimizers, frontier, bootstrap helpers. |
 | `src/data_io.py` | Versioned HDF5 persistence. |
 | `src/config.py` | Asset universe, paths, seeds, and simulation defaults. |
 | `data/monthly_returns.csv` | Cached monthly simple returns, 2010-01 to 2024-12. |
@@ -49,6 +49,35 @@ the committed results are reproducible without network access. Pass
   dominated, backward-bending points are not plotted. Any remaining dominated
   points found by the numerical optimizer are removed by a lower-envelope
   filter.
+
+### Risk parity
+
+Risk parity is defined on **portfolio variance**, not on CVaR. The weights
+solve the convex log-barrier problem
+
+```
+minimize 0.5 * w' Sigma w - (1 / N) * sum(log(w_i)),  w_i > 0,
+```
+
+whose first-order condition is `w_i * (Sigma w)_i = 1 / N`: every asset
+contributes the same share of portfolio variance. The solution is unique for
+a positive-definite covariance matrix and gives every asset a strictly
+positive weight. The raw solution is normalized to sum to one.
+
+CVaR risk parity was tried first and rejected for this asset universe. The
+Euler CVaR contribution of cash can be negative because cash tends to hedge
+the portfolio's worst months. Equal positive CVaR contributions are then
+infeasible, so the optimizer returns a corner solution: the point-estimate
+portfolio held 0% cash and split the CVaR budget equally across IEF, LQD and
+GLD, with an objective value of 0.083 instead of 0. Across bootstrap samples
+the cash weight jumped between 0% and 98%, and some stored solutions were
+local minima. Volatility risk parity avoids both problems: the point estimate
+is 88.3% BIL, 5.05% IEF, 4.36% LQD and 2.29% GLD, with 25% variance
+contributions, and the bootstrap weights are stable.
+
+The chart's risk axis remains CVaR, so the volatility risk-parity point is
+not necessarily CVaR-efficient. It is plotted as a reference portfolio, not
+as a frontier solution.
 
 ### Input uncertainty: joint bootstrap
 
@@ -134,7 +163,8 @@ python -m pytest
 
 The suite covers:
 
-- CVaR, risk contributions, and weight validation;
+- CVaR, variance risk contributions, and weight validation;
+- volatility risk-parity positivity, equal contributions, and bootstrap stability;
 - feasibility and optimality of the three reference portfolios;
 - monotonicity of the efficient frontier;
 - the `144 * Sigma / n` covariance scaling and the joint-bootstrap covariance;
@@ -150,11 +180,16 @@ With the committed data (`n=180`, `100` simulations, `seed=42`):
   `(n-1)/n * 144 * Sigma / n` reference.
 - The diagonal standard-deviation ratios are between **0.89 and 1.10** of the
   theoretical bootstrap reference (sampling noise with 100 draws).
-- All 100 special-portfolio optimizations converged after the tangency
-  multi-start fix.
+- All 100 special-portfolio optimizations converged; the volatility
+  risk-parity solve is convex and all weights are strictly positive.
+- The volatility risk-parity point estimate is 88.3% BIL, 5.05% IEF,
+  4.36% LQD and 2.29% GLD, with variance contribution shares of 25% each.
+  Across the 100 bootstrap samples its weights are stable: BIL
+  88.2% ± 0.9%, IEF 5.1% ± 0.5%, LQD 4.4% ± 0.4% and GLD 2.3% ± 0.2%.
+  The tangency weights remain highly dispersed, as expected.
 - All 100 efficient frontiers are non-empty and monotone in both CVaR and
   expected return; the average number of retained points is 19.5 out of 20.
-- The full test suite passes: **19 tests**.
+- The full test suite passes: **21 tests**.
 
 These are statistical checks, not a guarantee that the point estimates are
 unbiased. The bootstrap is conditional on the historical sample.
@@ -169,6 +204,10 @@ unbiased. The bootstrap is conditional on the historical sample.
   includes a cash proxy (BIL).
 - CVaR at 95% with 180 monthly observations uses roughly nine tail
   observations, so the risk estimate itself is noisy.
+- Risk parity is volatility-based, while the chart's risk axis is CVaR; the
+  risk-parity point is therefore not necessarily CVaR-efficient. CVaR risk
+  parity was rejected because cash can have a negative CVaR contribution,
+  producing unstable corner solutions.
 - The asset universe is small and defensive; the minimum-risk portfolio can
   legitimately concentrate in cash.
 - Expected returns are annualized by ×12 rather than by compounding; this is a
@@ -193,6 +232,8 @@ simulation_outputs/
   efficient_frontiers/frontier_{i}  [n_points, 2] (cvar, ret)
 ```
 
-Bootstrap samples are stored as a 3-D array; their row order is the resampled
-order and carries no date meaning. Dates are stored as ISO strings to avoid
+The `risk_parity_*` arrays contain **volatility** risk-parity weights (equal
+variance contributions), not CVaR risk-parity weights. Bootstrap samples are
+stored as a 3-D array; their row order is the resampled order and carries no
+date meaning. Dates are stored as ISO strings to avoid
 platform-dependent integer units.

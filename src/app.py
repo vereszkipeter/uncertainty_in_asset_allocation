@@ -20,6 +20,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (  # noqa: E402
+    CACHE_VERSION,
     CONFIDENCE_LEVEL,
     HDF5_FILE,
     N_FRONTIER_POINTS,
@@ -76,7 +77,12 @@ def calculate_user_portfolio_cloud(
 
 @st.cache_data(show_spinner=False)
 def cached_frontier(
-    _expected_returns, _monthly_returns, n_points, confidence, min_return
+    _expected_returns,
+    _monthly_returns,
+    n_points,
+    confidence,
+    min_return,
+    cache_version,
 ):
     return efficient_frontier(
         _expected_returns,
@@ -89,7 +95,11 @@ def cached_frontier(
 
 @st.cache_data(show_spinner=False)
 def cached_special_portfolios(
-    _expected_returns, _monthly_returns, risk_free_rate, confidence
+    _expected_returns,
+    _monthly_returns,
+    risk_free_rate,
+    confidence,
+    cache_version,
 ):
     return optimize_special_portfolios(
         _expected_returns,
@@ -100,13 +110,13 @@ def cached_special_portfolios(
 
 
 @st.cache_resource
-def load_data(file_path):
+def load_data(file_path, file_mtime):
     return load_results(file_path)
 
 
 # --- Data -------------------------------------------------------------------
 try:
-    all_data = load_data(HDF5_FILE)
+    all_data = load_data(HDF5_FILE, HDF5_FILE.stat().st_mtime_ns)
 except Exception as exc:
     st.error(
         f"Hiba a '{HDF5_FILE}' beolvasása közben: '{exc}'. "
@@ -132,7 +142,7 @@ st.caption(
 # --- Point-estimate portfolios ---------------------------------------------
 with st.spinner("Alap portfóliók és hatékony front számítása..."):
     base_special = cached_special_portfolios(
-        base_er, returns_data, risk_free_rate, confidence
+        base_er, returns_data, risk_free_rate, confidence, CACHE_VERSION
     )
     base_special_weights = {
         key: result.weights for key, result in base_special.items()
@@ -143,6 +153,7 @@ with st.spinner("Alap portfóliók és hatékony front számítása..."):
         N_FRONTIER_POINTS,
         confidence,
         portfolio_return(base_special_weights["min_risk"], base_er),
+        CACHE_VERSION,
     )
     base_metrics = {
         key: portfolio_metrics(weights, base_er, returns_data, confidence)
@@ -383,6 +394,10 @@ figure.update_layout(
     title="A portfólióallokáció bizonytalansága a kockázat-hozam térben",
 )
 st.plotly_chart(figure, use_container_width=True)
+st.caption(
+    "A Risk Parity portfólió szórásalapú kockázatparitás; "
+    "a CVaR a chart kockázati tengelye."
+)
 
 # --- Weights table and methodology -----------------------------------------
 with st.expander("Portfóliósúlyok táblázata"):
@@ -418,6 +433,12 @@ with st.expander("Módszertan és korlátok"):
         - **Várható hozam:** a bootstrap minta átlaga × 12 (évesítve).
         - **Kockázat:** havi empirikus CVaR (Expected Shortfall),
           {confidence:.0%}-os konfidenciaszinten.
+        - **Risk parity:** a variancia-hozzájárulásokat egyenlíti ki
+          (szórásalapú, mind a négy eszközre). A CVaR-alapú
+          hozzájárulások a farokban negatívak lehetnek a cash esetében,
+          ezért a CVaR-risk-paritás gyakran sarokmegoldást ad (BIL nélkül),
+          és instabil a bootstrap alatt. A charton a Risk Parity pont
+          CVaR-je a szokásos módon számolódik.
         - **Megkötések:** hosszú pozíciók, teljes befektetés, tranzakciós
           költség nélkül.
         - **Korlátok:** i.i.d. bootstrap (nincs idősor-függőség), in-sample

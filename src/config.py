@@ -37,3 +37,7 @@ END_DATE = "2024-12-31"
 
 # HDF5 schema version. Bump this whenever the on-disk layout changes.
 SCHEMA_VERSION = 2
+
+# Streamlit cache version. Bump this when the portfolio definitions change so
+# a hot-reloaded app cannot serve point estimates computed with old math.
+CACHE_VERSION = 2

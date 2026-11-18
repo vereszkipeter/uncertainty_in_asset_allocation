@@ -7,6 +7,9 @@ Conventions
 * ``expected_returns`` is an annualized vector, i.e. ``12 * monthly mean``.
 * CVaR is the empirical Expected Shortfall at ``confidence`` (default 95%)
   and is returned as a positive loss number.
+* Risk parity is defined on portfolio variance, not on CVaR. CVaR risk
+  contributions can be negative for tail-hedging assets (notably cash), which
+  makes the CVaR risk-parity problem prone to corner solutions.
 * All optimizations are long-only and fully invested (weights in [0, 1],
   sum to one).
 """
@@ -86,6 +89,10 @@ def cvar_risk_contributions(
     """Euler allocation of CVaR to the individual assets.
 
     The contributions sum to :func:`portfolio_cvar` up to numerical error.
+    They can be negative for assets that hedge the portfolio tail (for example
+    cash). For that reason CVaR risk contributions are kept as a diagnostic and
+    are not used to define the primary risk-parity portfolio; see
+    :func:`risk_parity_volatility_weights`.
     """
     returns = _as_returns(monthly_returns)
     w = _check_weights(weights, returns.shape[1])
@@ -97,16 +104,98 @@ def cvar_risk_contributions(
     return w * (-tail.mean(axis=0))
 
 
-def risk_parity_cvar_objective(
-    weights, monthly_returns, confidence: float = 0.95
-) -> float:
-    """Squared deviation of CVaR risk contributions from equal shares."""
-    contributions = cvar_risk_contributions(weights, monthly_returns, confidence)
+def variance_risk_contributions(weights, monthly_returns) -> np.ndarray:
+    """Euler allocation of portfolio variance to the individual assets.
+
+    The contributions ``w_i * (Sigma w)_i`` sum to ``w' Sigma w``. Their
+    shares are the standard risk-parity contributions and are always positive
+    for a positive-definite covariance matrix with positive weights.
+    """
+    returns = _as_returns(monthly_returns)
+    w = _check_weights(weights, returns.shape[1])
+    covariance = np.atleast_2d(np.cov(returns, rowvar=False, ddof=1))
+    return w * (covariance @ w)
+
+
+def risk_parity_variance_objective(weights, monthly_returns) -> float:
+    """Squared deviation of variance risk contributions from equal shares."""
+    contributions = variance_risk_contributions(weights, monthly_returns)
     total = contributions.sum()
-    if not np.isfinite(total) or total <= 1e-12:
+    if not np.isfinite(total) or total <= 1e-18:
         return 1e6
     target = 1.0 / len(contributions)
     return float(np.sum((contributions / total - target) ** 2))
+
+
+def risk_parity_volatility_weights(
+    monthly_returns,
+    *,
+    max_iter: int = 1000,
+    tol: float = 1e-12,
+) -> OptimizationResult:
+    """Long-only equal-variance-contribution (volatility) risk parity.
+
+    The weights solve the convex log-barrier problem
+
+        minimize 0.5 * w' Sigma w - (1 / N) * sum(log(w_i)),  w_i > 0.
+
+    The first-order condition is ``w_i * (Sigma w)_i = 1 / N``, i.e. equal
+    variance contributions. The solution is unique for a positive-definite
+    covariance matrix. The raw solution is normalized to sum to one; this
+    leaves the contribution shares unchanged. Unlike CVaR risk parity, every
+    asset receives a strictly positive weight.
+    """
+    returns = _as_returns(monthly_returns)
+    n_assets = returns.shape[1]
+    if returns.shape[0] < 2:
+        raise ValueError("at least two observations are required")
+    covariance = np.atleast_2d(np.cov(returns, rowvar=False, ddof=1))
+    scale = float(np.mean(np.diag(covariance)))
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("covariance matrix must have positive variance")
+    covariance = covariance / scale
+
+    target = 1.0 / n_assets
+
+    def objective(weights: np.ndarray) -> float:
+        return float(
+            0.5 * weights @ covariance @ weights
+            - target * np.sum(np.log(weights))
+        )
+
+    def gradient(weights: np.ndarray) -> np.ndarray:
+        return covariance @ weights - target / weights
+
+    initial = 1.0 / np.sqrt(np.diag(covariance))
+    initial = initial / initial.sum()
+    result = minimize(
+        objective,
+        initial,
+        jac=gradient,
+        method="SLSQP",
+        bounds=tuple((1e-12, None) for _ in range(n_assets)),
+        options={"maxiter": max_iter, "ftol": tol},
+    )
+
+    raw = np.asarray(getattr(result, "x", []), dtype=float)
+    if (
+        raw.shape != (n_assets,)
+        or not np.all(np.isfinite(raw))
+        or np.any(raw <= 0.0)
+        or raw.sum() <= 0.0
+    ):
+        return OptimizationResult(
+            weights=np.full(n_assets, 1.0 / n_assets),
+            success=False,
+            message=f"risk-parity fallback: {result.message}",
+        )
+
+    weights = raw / raw.sum()
+    return OptimizationResult(
+        weights=weights,
+        success=bool(result.success),
+        message=str(result.message),
+    )
 
 
 def negative_cvar_sharpe(
@@ -175,13 +264,16 @@ def optimize_special_portfolios(
 ) -> dict[str, OptimizationResult]:
     """Compute the min-risk, CVaR-tangency and risk-parity portfolios.
 
-    SLSQP is used with long-only bounds. The tangency objective is
-    non-smooth (CVaR is piecewise linear), so it is started from several
-    feasible points; this removes the occasional "positive directional
-    derivative" failure seen with a single equal-weight start. A failed
-    optimization is reported in ``OptimizationResult.success`` and a feasible
-    fallback is still returned, so callers never receive NaNs or negative
-    weights.
+    The minimum-risk portfolio and the tangency portfolio use CVaR. The
+    risk-parity portfolio equalizes **variance** contributions (volatility
+    risk parity), because CVaR contributions can be negative for tail-hedging
+    assets and produce unstable corner solutions. SLSQP is used with
+    long-only bounds. The tangency objective is non-smooth (CVaR is
+    piecewise linear), so it is started from several feasible points; this
+    removes the occasional "positive directional derivative" failure seen
+    with a single equal-weight start. A failed optimization is reported in
+    ``OptimizationResult.success`` and a feasible fallback is still returned,
+    so callers never receive NaNs or negative weights.
     """
     er = np.asarray(expected_returns, dtype=float)
     returns = _as_returns(monthly_returns)
@@ -208,19 +300,7 @@ def optimize_special_portfolios(
         message=str(min_risk_result.message),
     )
 
-    risk_parity_result = _run_slsqp(
-        risk_parity_cvar_objective,
-        (returns, confidence),
-        initial_weights,
-        bounds,
-        constraints,
-        options,
-    )
-    risk_parity = OptimizationResult(
-        weights=_fallback_weights(risk_parity_result, n_assets),
-        success=bool(risk_parity_result.success),
-        message=str(risk_parity_result.message),
-    )
+    risk_parity = risk_parity_volatility_weights(returns)
 
     max_return_weights = np.zeros(n_assets)
     max_return_weights[int(np.argmax(er))] = 1.0
