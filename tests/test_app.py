@@ -1,5 +1,6 @@
 """Smoke tests for the Streamlit dashboard structure."""
 
+import json
 from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
@@ -27,6 +28,14 @@ def test_dashboard_simulation_toggle_rerenders() -> None:
 
     assert not app.exception, [item.value for item in app.exception]
     assert app.caption  # chart annotation and simulation note are present
+
+    chart = json.loads(app.get("plotly_chart")[0].proto.spec)
+    bootstrap_legend = [
+        trace for trace in chart["data"] if trace.get("legend") == "legend2"
+    ]
+    assert len(bootstrap_legend) == 4
+    assert len({trace["marker"]["symbol"] for trace in bootstrap_legend}) == 4
+    assert len({trace["marker"]["color"] for trace in bootstrap_legend}) == 4
 
 
 def test_reset_button_restores_equal_weights() -> None:

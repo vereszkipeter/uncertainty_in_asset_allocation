@@ -74,7 +74,7 @@ COLORS = {
     "user": "#D55E00",
     "min_risk": "#009E73",
     "tangency": "#CC79A7",
-    "risk_parity": "#E69F00",
+    "risk_parity": "#56B4E9",
 }
 PORTFOLIO_NAMES = {
     "min_risk": "Min Risk",
@@ -82,9 +82,16 @@ PORTFOLIO_NAMES = {
     "risk_parity": "Risk Parity",
 }
 SIMULATION_SYMBOLS = {
-    "min_risk": "circle-open",
-    "tangency": "square-open",
-    "risk_parity": "triangle-up-open",
+    "min_risk": "circle",
+    "tangency": "square",
+    "risk_parity": "triangle-up",
+    "user": "star",
+}
+SIMULATION_LABELS = {
+    "min_risk": "Min Risk",
+    "tangency": "Tangency",
+    "risk_parity": "Risk Parity",
+    "user": "Ön portfóliója",
 }
 
 
@@ -207,8 +214,8 @@ show_simulations = st.sidebar.toggle(
 )
 if show_simulations:
     st.sidebar.caption(
-        "A halvány pontok és frontok ugyanazokból a bootstrap mintákból "
-        "származnak, mint a pontbecslések bizonytalansági sávja."
+        "A halvány pontok és frontok bootstrap mintákból származnak; "
+        "a szimbólumok kulcsa a chart bal felső sarkában van."
     )
 
 st.sidebar.divider()
@@ -302,14 +309,13 @@ if show_simulations:
                 text=hover_texts,
                 mode="markers",
                 marker=dict(
-                    color=to_rgba(COLORS[key], 0.18),
-                    size=7,
+                    color=to_rgba(COLORS[key], 0.42),
+                    size=8.5,
                     symbol=SIMULATION_SYMBOLS[key],
-                    line=dict(color=to_rgba(COLORS[key], 0.85), width=1.2),
+                    line=dict(color=to_rgba(COLORS[key], 0.95), width=0.8),
                 ),
                 name=f"Bootstrap: {PORTFOLIO_NAMES[key]}",
-                legendgroup="bootstrap",
-                legendrank=10,
+                legendgroup=f"bootstrap_{key}",
                 showlegend=False,
                 hovertemplate=(
                     f"<b>Bootstrap: {PORTFOLIO_NAMES[key]}</b><br><br>"
@@ -336,14 +342,13 @@ if show_simulations:
                 customdata=[user_weights_text_cloud] * len(user_cloud_df),
                 mode="markers",
                 marker=dict(
-                    color=to_rgba(COLORS["user"], 0.2),
-                    size=7,
-                    symbol="star-open",
-                    line=dict(color=to_rgba(COLORS["user"], 0.9), width=1.2),
+                    color=to_rgba(COLORS["user"], 0.45),
+                    size=9,
+                    symbol="star",
+                    line=dict(color=to_rgba(COLORS["user"], 0.95), width=0.8),
                 ),
                 name="Bootstrap: Az Ön portfóliója",
-                legendgroup="bootstrap",
-                legendrank=10,
+                legendgroup="bootstrap_user",
                 showlegend=False,
                 hovertemplate=(
                     "<b>Bootstrap: Az Ön portfóliója</b><br><br>"
@@ -353,26 +358,28 @@ if show_simulations:
             )
         )
 
-    # One legend entry controls the whole bootstrap group. The actual traces
-    # stay thin and transparent, while this opaque dummy supplies a readable
-    # swatch on both light and dark themes.
-    figure.add_trace(
-        go.Scatter(
-            x=[None],
-            y=[None],
-            mode="markers",
-            marker=dict(
-                color="#8C8C8C",
-                size=9,
-                symbol="square-open",
-                line=dict(color="#8C8C8C", width=1.5),
-            ),
-            name="Bootstrap felhők",
-            legendgroup="bootstrap",
-            legendrank=10,
-            hoverinfo="skip",
+    # A separate compact legend in the empty upper-left corner maps each
+    # bootstrap cloud to its marker shape. The opaque dummy swatches are also
+    # clickable: each one toggles its own cloud without hiding the others.
+    for rank, key in enumerate(SIMULATION_LABELS, start=1):
+        figure.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                marker=dict(
+                    color=COLORS[key],
+                    size=9,
+                    symbol=SIMULATION_SYMBOLS[key],
+                    line=dict(color=COLORS[key], width=0.8),
+                ),
+                name=SIMULATION_LABELS[key],
+                legend="legend2",
+                legendgroup=f"bootstrap_{key}",
+                legendrank=rank,
+                hoverinfo="skip",
+            )
         )
-    )
 
 figure.add_trace(
     go.Scatter(
@@ -509,6 +516,18 @@ figure.update_layout(
         groupclick="togglegroup",
         font=dict(size=11),
         bgcolor="rgba(0,0,0,0)",
+    ),
+    legend2=dict(
+        title=dict(text="Bootstrap", font=dict(size=10)),
+        orientation="v",
+        x=0.01,
+        y=0.99,
+        xanchor="left",
+        yanchor="top",
+        groupclick="togglegroup",
+        font=dict(size=10),
+        bgcolor="rgba(0,0,0,0)",
+        itemsizing="constant",
     ),
     height=540,
     margin=dict(l=10, r=10, t=10, b=120),

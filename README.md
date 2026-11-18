@@ -163,9 +163,11 @@ was written with an older schema, the app shows an error asking you to run
   **Minta bizonytalanság** (sample uncertainty), because the bootstrap
   resamples the historical return sample rather than a structural model.
 - The chart legend sits below the plot and uses the Okabe-Ito
-  colorblind-safe palette. Bootstrap traces share one opaque legend entry
-  (`Bootstrap felhők`); the underlying clouds are thin, translucent outlines
-  with distinct marker shapes per portfolio.
+  colorblind-safe palette. Bootstrap clouds have their own compact legend in
+  the empty upper-left corner of the plot, with one filled, color-coded shape
+  per portfolio. Each legend entry also toggles its own cloud, so overlapping
+  clouds can be inspected separately. The sidebar master toggle still hides
+  all bootstrap traces at once.
 - The current portfolio's annualized return and monthly CVaR are shown
   together with help text clarifying their different horizons.
 - The chart annotation quantifies the CVaR gap between the user's portfolio
