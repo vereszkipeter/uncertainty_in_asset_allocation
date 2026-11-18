@@ -27,3 +27,14 @@ def test_dashboard_simulation_toggle_rerenders() -> None:
 
     assert not app.exception, [item.value for item in app.exception]
     assert app.caption  # chart annotation and simulation note are present
+
+
+def test_reset_button_restores_equal_weights() -> None:
+    app = AppTest.from_file(str(APP_PATH), default_timeout=120).run()
+    app.sidebar.slider[0].set_value(0.70).run()
+    assert app.sidebar.slider[0].value == 0.70
+
+    app.sidebar.button[0].click().run()
+
+    assert not app.exception, [item.value for item in app.exception]
+    assert [slider.value for slider in app.sidebar.slider] == [0.25] * 4

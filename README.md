@@ -194,7 +194,7 @@ The suite covers:
 - the dashboard's table builders, ticker labels, frontier interpolation and
   insight text;
 - a Streamlit `AppTest` smoke test for the page title, sidebar controls,
-  tables and the simulation toggle.
+  tables, the simulation toggle and the reset-weights button.
 
 ## Validation of the committed bundle
 
@@ -214,7 +214,7 @@ With the committed data (`n=180`, `100` simulations, `seed=42`):
   The tangency weights remain highly dispersed, as expected.
 - All 100 efficient frontiers are non-empty and monotone in both CVaR and
   expected return; the average number of retained points is 19.5 out of 20.
-- The full test suite passes: **32 tests**.
+- The full test suite passes: **33 tests**.
 
 These are statistical checks, not a guarantee that the point estimates are
 unbiased. The bootstrap is conditional on the historical sample.

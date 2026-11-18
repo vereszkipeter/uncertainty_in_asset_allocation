@@ -213,6 +213,20 @@ if show_simulations:
 
 st.sidebar.divider()
 st.sidebar.header("A portfólió súlyai")
+
+
+def reset_weights() -> None:
+    """Reset slider state from the button callback.
+
+    Streamlit forbids assigning a widget-backed session-state key after the
+    widget has been instantiated. An ``on_click`` callback runs before the
+    script and therefore before the sliders are created.
+    """
+    equal_weight = 1.0 / len(asset_classes)
+    for asset in asset_classes:
+        st.session_state[f"weight_{asset}"] = equal_weight
+
+
 weights = {
     asset: st.sidebar.slider(
         f"{index + 1}. {asset}",
@@ -241,9 +255,11 @@ st.sidebar.markdown(
         for asset in asset_classes
     )
 )
-if st.sidebar.button("Egyenlő súlyok visszaállítása", width="stretch"):
-    for asset in asset_classes:
-        st.session_state[f"weight_{asset}"] = 1.0 / len(asset_classes)
+st.sidebar.button(
+    "Egyenlő súlyok visszaállítása",
+    width="stretch",
+    on_click=reset_weights,
+)
 
 # --- Current portfolio summary and chart -----------------------------------
 user_cvar, user_ret = portfolio_metrics(
